@@ -36,7 +36,7 @@
   "packageManager": "pnpm@10.30.2",
   "pnpm": {
     "overrides": {
-      "hono": "^4.12.21",
+      "hono": "^4.12.25",
       "fast-uri": "^3.1.2",
       "ip-address": "^10.1.1"
     }
