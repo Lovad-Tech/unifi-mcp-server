@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SITE_NAME_DESCRIPTION } from "./tools/site-param.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 // MCP Prompts: pre-built workflow templates that clients can invoke. Each
@@ -12,7 +13,7 @@ export function registerPrompts(server: McpServer): void {
       title: "Triage site degradation",
       description: "Investigate a site's health, recent reboots, client impact, and WAN status to produce a triage summary.",
       argsSchema: {
-        hostName: z.string().describe("Host name of the site to triage (e.g. 'USM')"),
+        hostName: z.string().describe(SITE_NAME_DESCRIPTION),
         windowHours: z.string().optional().describe("Reboot detection window in hours (default: 24)"),
       },
     },
@@ -50,7 +51,7 @@ export function registerPrompts(server: McpServer): void {
       description: "Audit a firmware rollout: which hosts/devices are on the target version, which are lagging, and what to upgrade next.",
       argsSchema: {
         targetVersion: z.string().describe("Target firmware version to roll out (e.g. '7.5.83')"),
-        hostNameFilter: z.string().optional().describe("Optional host name (or comma-separated list) to scope the audit; default scans all hosts"),
+        hostNameFilter: z.string().optional().describe(`Optional site to scope the audit, or a comma-separated list. ${SITE_NAME_DESCRIPTION} Omit to scan every site.`),
       },
     },
     ({ targetVersion, hostNameFilter }) => {
@@ -89,7 +90,7 @@ export function registerPrompts(server: McpServer): void {
       title: "WAN uptime SLA report",
       description: "Compute a WAN uptime SLA-style report for a site over a window, with relative ranking against the fleet.",
       argsSchema: {
-        hostName: z.string().describe("Host name of the site to report on"),
+        hostName: z.string().describe(SITE_NAME_DESCRIPTION),
         days: z.string().optional().describe("Window length in days (default: 30)"),
       },
     },
@@ -129,7 +130,7 @@ export function registerPrompts(server: McpServer): void {
       title: "Cross-site anomaly detection",
       description: "Compute fleet medians across sites and flag sites that deviate >2σ from the median on key health metrics.",
       argsSchema: {
-        sitesFilter: z.string().optional().describe("'all' (default) or comma-separated host names to restrict the scan"),
+        sitesFilter: z.string().optional().describe(SITE_NAME_DESCRIPTION),
       },
     },
     ({ sitesFilter }) => {
@@ -143,7 +144,7 @@ export function registerPrompts(server: McpServer): void {
               `Detect cross-site anomalies (filter=${JSON.stringify(filter)}).`,
               "",
               "Steps:",
-              "1. Call `list-hosts` to enumerate consoles. If sitesFilter !== 'all', restrict to host names in the comma-separated list.",
+              "1. Call `find-site` to look up sites by customer name. If sitesFilter !== 'all', restrict to host names in the comma-separated list.",
               "2. For each in-scope host, call `summarize-site` with hostName=<host> to collect device count, online %, WAN uptime, and (when connector is available) client count.",
               "3. Compute fleet medians and standard deviation (population σ) for: deviceCount, onlinePct, wanUptimePct, and clientDensity = clientCount / deviceCount (skip sites where clientCount is unavailable).",
               "4. Flag a site as an outlier if any metric is more than 2σ away from the median (in the worse direction — e.g. low onlinePct, low wanUptime, very high or very low clientDensity).",
@@ -167,7 +168,7 @@ export function registerPrompts(server: McpServer): void {
       title: "MSP — onboard-site readiness checklist",
       description: "Validate that a newly-added site has the firmware, config, and security baselines an MSP would require before going live.",
       argsSchema: {
-        hostName: z.string().describe("Host name of the new site (e.g. 'CLIENT-HQ')"),
+        hostName: z.string().describe(SITE_NAME_DESCRIPTION),
       },
     },
     ({ hostName }) => ({
@@ -200,7 +201,7 @@ export function registerPrompts(server: McpServer): void {
       title: "MSP — monthly site health report",
       description: "Generate the monthly customer-facing health report for one site (uptime, devices, top consumers, anomalies, recommended actions).",
       argsSchema: {
-        hostName: z.string().describe("Host name of the client's site"),
+        hostName: z.string().describe(SITE_NAME_DESCRIPTION),
         clientLabel: z.string().optional().describe("Customer-facing label to use in the report header (defaults to hostName)"),
       },
     },
@@ -278,7 +279,7 @@ export function registerPrompts(server: McpServer): void {
       title: "MSP — investigate 'internet is slow' complaint at a site",
       description: "Triage a customer bandwidth complaint by correlating WAN uptime, top consumers, and (when connector is available) DPI category breakdowns.",
       argsSchema: {
-        hostName: z.string().describe("Host name of the affected site"),
+        hostName: z.string().describe(SITE_NAME_DESCRIPTION),
         windowHours: z.string().optional().describe("Recent window to focus on (default '24'). Useful when the customer can pin down a time."),
       },
     },

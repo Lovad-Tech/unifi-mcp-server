@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { unifiClient } from "./client.js";
-import { resolveDevicesByHostName, resolveAllDevices } from "./helpers/resolver.js";
+import { resolveDeviceHostEntry, resolveAllDevices } from "./helpers/resolver.js";
 
 const UI_DIR = join(dirname(fileURLToPath(import.meta.url)), "ui");
 const SUMMARIZE_SITE_HTML = readFileSync(join(UI_DIR, "summarize-site.html"), "utf-8");
@@ -11,8 +11,8 @@ const SUMMARIZE_SITE_HTML = readFileSync(join(UI_DIR, "summarize-site.html"), "u
 /**
  * MCP Resources for hot UniFi entities.
  * URI scheme: `unifi://`
- *   - unifi://site/{name}                   — site overview by host name (e.g. 'USM')
- *   - unifi://site/{hostName}/devices       — devices for a specific site by host name
+ *   - unifi://site/{name}                   — site overview by customer/site name
+ *   - unifi://site/{hostName}/devices       — devices for a site, by customer/site name
  *   - unifi://devices                       — all devices across all sites
  *   - unifi://hosts                         — all UniFi consoles
  *   - unifi://reboots/recent                — recent reboot events (24h) across all sites
@@ -42,13 +42,19 @@ export function registerResources(server: McpServer): void {
     new ResourceTemplate("unifi://site/{name}", { list: undefined }),
     {
       title: "UniFi Site",
-      description: "Site overview by host name (e.g. 'USM') — devices + statistics",
+      description: "Site overview by customer or site name — devices + statistics",
       mimeType: "application/json",
     },
     async (uri, vars) => {
       const name = decodeURIComponent(String(vars.name));
-      const data = await resolveDevicesByHostName(name);
-      return asJson(uri.toString(), data ?? { error: `site '${name}' not found` });
+      try {
+        const { entry, devices } = await resolveDeviceHostEntry(name);
+        return asJson(uri.toString(), { site: entry.displayName, ...(devices ?? {}) });
+      } catch (err) {
+        return asJson(uri.toString(), {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   );
 
@@ -57,14 +63,21 @@ export function registerResources(server: McpServer): void {
     new ResourceTemplate("unifi://site/{hostName}/devices", { list: undefined }),
     {
       title: "UniFi Site Devices",
-      description: "Devices for a specific site by host name (e.g. 'USM') — compact device list",
+      description: "Devices for a site, by customer or site name — compact device list",
       mimeType: "application/json",
     },
     async (uri, vars) => {
       const hostName = decodeURIComponent(String(vars.hostName));
-      const entry = await resolveDevicesByHostName(hostName);
+      let entry;
+      try {
+        entry = (await resolveDeviceHostEntry(hostName)).devices;
+      } catch (err) {
+        return asJson(uri.toString(), {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       if (!entry) {
-        return asJson(uri.toString(), { error: `site '${hostName}' not found` });
+        return asJson(uri.toString(), { error: `no device inventory for '${hostName}'` });
       }
       return asJson(uri.toString(), {
         hostName: entry.hostName,

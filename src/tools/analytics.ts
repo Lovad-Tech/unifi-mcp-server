@@ -1,4 +1,6 @@
 import { z } from "zod/v4";
+import { SITE_NAME_DESCRIPTION } from "./site-param.js";
+import { buildSiteIndex, matchSites, siteLabelsBySiteId } from "../helpers/site-index.js";
 import { unifiClient } from "../client.js";
 import { connectorClient } from "../connector-client.js";
 import {
@@ -27,25 +29,33 @@ interface SiteStatistics {
 // --- Tool: compare-sites -------------------------------------------------
 
 export const compareSitesSchema = z.object({
-  names: z.array(z.string()).optional().describe("Specific site host names to compare (omit for all)"),
+  names: z.array(z.string()).optional().describe(`Sites to compare. ${SITE_NAME_DESCRIPTION} Omit to compare all.`),
   extractFields: ef,
 });
 
 export async function compareSites(params: z.infer<typeof compareSitesSchema>) {
-  const [sitesResp, devicesData] = await Promise.all([
+  const [sitesResp, devicesData, labels] = await Promise.all([
     unifiClient.get<{ data: Array<{ siteId: string; hostId: string; statistics: SiteStatistics }> }>("/sites"),
     resolveAllDevices(),
+    siteLabelsBySiteId(),
   ]);
+  const index = await buildSiteIndex();
 
-  const hostIdToName = new Map<string, string>();
-  for (const d of devicesData) hostIdToName.set(d.hostId, d.hostName);
-
-  const filterSet = params.names ? new Set(params.names.map((n) => n.toUpperCase())) : null;
+  // Label and filter on the SITE, not the console. Keyed on hostName, all 60
+  // sites of a shared console carried one label and a customer-name filter
+  // matched nothing.
+  const filterSet = params.names
+    ? new Set(
+        params.names.flatMap((n) =>
+          matchSites(index, n).map((e) => e.cloudSiteId),
+        ),
+      )
+    : null;
 
   const rows = sitesResp.data
     .map((site) => {
-      const hostName = hostIdToName.get(site.hostId) ?? "unknown";
-      if (filterSet && !filterSet.has(hostName.toUpperCase())) return null;
+      const hostName = labels.get(site.siteId) ?? "unknown";
+      if (filterSet && !filterSet.has(site.siteId)) return null;
 
       const devices = devicesData.find((d) => d.hostId === site.hostId)?.devices ?? [];
       const online = devices.filter((d) => d.status === "online").length;
@@ -139,10 +149,12 @@ export const wanUptimeTrendSchema = z.object({
 });
 
 export async function wanUptimeTrend(params: z.infer<typeof wanUptimeTrendSchema>) {
-  const sites = await resolveAllSites();
-  const sitesResp = await unifiClient.get<{
-    data: Array<{ hostId: string; statistics: SiteStatistics }>;
-  }>("/sites");
+  const [labels, sitesResp] = await Promise.all([
+    siteLabelsBySiteId(),
+    unifiClient.get<{
+      data: Array<{ siteId: string; hostId: string; statistics: SiteStatistics }>;
+    }>("/sites"),
+  ]);
 
   const rows: Array<{
     site: string;
@@ -153,7 +165,7 @@ export async function wanUptimeTrend(params: z.infer<typeof wanUptimeTrendSchema
   }> = [];
 
   for (const s of sitesResp.data) {
-    const hostName = sites.find((x) => x.hostId === s.hostId)?.hostName ?? "unknown";
+    const hostName = labels.get(s.siteId) ?? "unknown";
     const wans = s.statistics.wans ?? {};
     for (const [wanName, wan] of Object.entries(wans)) {
       const uptime = wan.wanUptime ?? 0;
@@ -210,7 +222,7 @@ interface ConnectorClient {
 }
 
 export const topClientsByBandwidthSchema = z.object({
-  name: z.string().describe("Site host name (e.g., 'USM')"),
+  name: z.string().describe(SITE_NAME_DESCRIPTION),
   topN: z.coerce.number().optional().default(10).describe("Number of top clients to return (default: 10)"),
   metric: z.enum(["combined", "tx", "rx"]).optional().default("combined")
     .describe("Bandwidth metric: combined (tx+rx), tx-only, rx-only"),
@@ -227,13 +239,6 @@ export async function topClientsByBandwidth(params: z.infer<typeof topClientsByB
   }
 
   const ctx = await resolveConnectorContext(params.name);
-  if (!ctx) {
-    return {
-      site: params.name,
-      error: `Site '${params.name}' not found or connector unavailable`,
-      clients: [],
-    };
-  }
 
   const resp = await connectorClient.get<{ data: ConnectorClient[] }>(
     ctx.hostId,
@@ -273,7 +278,7 @@ export async function topClientsByBandwidth(params: z.infer<typeof topClientsByB
   }, 0);
 
   return {
-    site: ctx.hostName,
+    site: ctx.displayName,
     checkedAt: new Date().toISOString(),
     metric: params.metric,
     totalClients: clients.length,
