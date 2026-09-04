@@ -1,8 +1,10 @@
 import { z } from "zod/v4";
+import { SITE_NAME_DESCRIPTION } from "./site-param.js";
 import { aggregate } from "@us-all/mcp-toolkit";
 import { unifiClient } from "../client.js";
 import { connectorClient } from "../connector-client.js";
-import { resolveDevicesByHostName, resolveConnectorContext } from "../helpers/resolver.js";
+import { resolveConnectorContext, resolveDeviceHostEntry } from "../helpers/resolver.js";
+import { SiteResolutionError } from "../helpers/site-index.js";
 import { isConnectorAvailable } from "../config.js";
 import { extractFieldsDescription } from "./extract-fields.js";
 
@@ -37,7 +39,7 @@ function classifyWan(uptimePct: number | null): WanStatus {
  */
 
 export const summarizeSiteSchema = z.object({
-  name: z.string().describe("Site host name (e.g. 'USM')"),
+  name: z.string().describe(SITE_NAME_DESCRIPTION),
   includeClients: z.boolean().optional().default(false).describe("Include connected clients (requires owner key)"),
   clientLimit: z.coerce.number().optional().default(50).describe("Max clients to fetch"),
   includeNetworks: z.boolean().optional().default(true).describe("Include network configs (requires owner key)"),
@@ -54,20 +56,39 @@ interface SiteStats {
 
 export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>) {
   const name = params.name;
-  const hostEntry = await resolveDevicesByHostName(name);
-  if (!hostEntry) {
-    return { site: name, error: `site '${name}' not found`, summary: { found: false } };
+
+  // Resolve through the fleet index FIRST. This used to call
+  // resolveDevicesByHostName, an exact match on console hostname, and bail
+  // before any of the site resolution below could run -- so every customer on a
+  // multi-site console got "site not found" from right here.
+  let entry;
+  let hostEntry;
+  try {
+    ({ entry, devices: hostEntry } = await resolveDeviceHostEntry(name));
+  } catch (err) {
+    return {
+      site: name,
+      error: err instanceof SiteResolutionError ? err.message : String(err),
+      summary: { found: false },
+    };
   }
 
-  const sitesResp = await unifiClient.get<{ data: Array<{ hostId: string; statistics: SiteStats }> }>("/sites").catch(() => ({ data: [] }));
-  const siteData = sitesResp.data.find((s) => s.hostId === hostEntry.hostId);
+  const sitesResp = await unifiClient.get<{ data: Array<{ siteId: string; hostId: string; statistics: SiteStats }> }>("/sites").catch(() => ({ data: [] }));
+  // By site id, not by host id: a console carrying many sites returns many rows here
+  // and `find(hostId)` takes whichever is first -- the empty Default site.
+  const siteData = sitesResp.data.find((s) => s.siteId === entry.cloudSiteId);
+
+  const caveats: string[] = [];
 
   let connectorCtx = null;
   if (isConnectorAvailable() && (params.includeClients || params.includeNetworks || params.includeWifi)) {
-    connectorCtx = await resolveConnectorContext(name).catch(() => null);
+    // Record why the connector view is missing. Swallowing it made an outage,
+    // a permissions problem and a typo look identical in the output.
+    connectorCtx = await resolveConnectorContext(name).catch((err) => {
+      caveats.push(`connector context unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
   }
-
-  const caveats: string[] = [];
 
   const ctx = connectorCtx;
   const { clients, networks, wifi } = await aggregate(
@@ -88,7 +109,10 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
   // Slim each device to drop noise fields (uidb icon blob, adoptionTime,
   // isManaged, note) that bloat the response without aiding LLM analysis.
   // Callers needing full device payload should use list-devices directly.
-  const devices = hostEntry.devices.map((d) => ({
+  // A console can be absent from /devices (it reports only hosts the key owns
+  // devices for). That is an empty device list, not a failed lookup.
+  if (!hostEntry) caveats.push(`no device inventory returned for console ${entry.hostName}`);
+  const devices = (hostEntry?.devices ?? []).map((d) => ({
     id: d.id,
     mac: d.mac,
     name: d.name,
@@ -112,7 +136,7 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
 
   return {
     site: name,
-    hostId: hostEntry.hostId,
+    hostId: entry.hostId,
     devices: { total: devices.length, online: onlineDevices, offline: devices.length - onlineDevices, list: devices },
     wan: wans,
     clients,
@@ -149,7 +173,7 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
  */
 
 export const siteHealthTimelineSchema = z.object({
-  hostName: z.string().describe("Site host name (e.g. 'USM')"),
+  hostName: z.string().describe(SITE_NAME_DESCRIPTION),
   lookbackDays: z.coerce.number().int().min(1).max(90).optional().default(7)
     .describe("Window for reboot detection in days (1-90, default 7)"),
   extractFields: ef,
@@ -185,7 +209,24 @@ export async function siteHealthTimeline(params: z.infer<typeof siteHealthTimeli
 
   const caveats: string[] = [];
 
-  const hostEntry = await resolveDevicesByHostName(params.hostName);
+  // Routed through the index like every other site tool. Left as an exact
+  // hostname match, this one tool kept the exact behaviour the fork removes --
+  // while its own parameter told the model to pass a customer name.
+  let timelineEntry;
+  try {
+    timelineEntry = await resolveDeviceHostEntry(params.hostName);
+  } catch (err) {
+    return {
+      hostName: params.hostName,
+      hostId: null,
+      period,
+      devices: [] as DeviceTimelineEntry[],
+      reboots: [],
+      clients: null,
+      caveats: [err instanceof SiteResolutionError ? err.message : String(err)],
+    };
+  }
+  const hostEntry = timelineEntry.devices;
   if (!hostEntry) {
     return {
       hostName: params.hostName,

@@ -1,11 +1,26 @@
 import { createWrapToolHandler } from "@us-all/mcp-toolkit";
 import { UniFiError } from "../client.js";
+import { SiteResolutionError } from "../helpers/site-index.js";
 import { ConnectorError, ConnectorUnavailableError } from "../connector-client.js";
 import { LocalControllerError, LocalControllerUnavailableError } from "../local-controller-client.js";
 
 export const wrapToolHandler = createWrapToolHandler({
   redactionPatterns: [/X-API-KEY/i, /Cookie/i, /TOKEN=[A-Za-z0-9._-]+/i, /X-CSRF-Token/i],
   errorExtractors: [
+    {
+      // Registered so the status survives WITHOUT each tool remembering to
+      // catch. The fallback branch keeps only `message`, and the status is the
+      // one thing a caller needs: 300 "say which one", 404 "no such site",
+      // 502 "the console did not answer".
+      match: (error) => error instanceof SiteResolutionError,
+      extract: (error) => {
+        const e = error as SiteResolutionError;
+        return {
+          kind: "structured",
+          data: { message: e.message, status: e.status },
+        };
+      },
+    },
     {
       match: (error) => error instanceof ConnectorUnavailableError,
       extract: (error) => ({

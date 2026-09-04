@@ -1,11 +1,13 @@
 import { z } from "zod/v4";
+import { SITE_NAME_DESCRIPTION } from "./site-param.js";
 import { unifiClient } from "../client.js";
 import {
   resolveAllSites,
-  resolveDevicesByHostName,
+  resolveDeviceHostEntry,
   resolveAllDevices,
   type DeviceEntry,
 } from "../helpers/resolver.js";
+import { SiteResolutionError, siteLabelsBySiteId } from "../helpers/site-index.js";
 import { extractFieldsDescription } from "./extract-fields.js";
 
 const ef = z.string().optional().describe(extractFieldsDescription);
@@ -151,7 +153,7 @@ export const listSitesOverviewSchema = z.object({
 });
 
 export async function listSitesOverview() {
-  const [sites, devicesData] = await Promise.all([
+  const [sites, devicesData, labels] = await Promise.all([
     unifiClient.get<{ data: Array<{
       siteId: string;
       hostId: string;
@@ -159,25 +161,23 @@ export async function listSitesOverview() {
       statistics: SiteStatistics;
     }> }>("/sites"),
     resolveAllDevices(),
+    siteLabelsBySiteId(),
   ]);
 
-  // Build hostId -> hostName map from devices response
-  const hostIdToName = new Map<string, string>();
-  for (const d of devicesData) {
-    hostIdToName.set(d.hostId, d.hostName);
-  }
-
-  // Build hostName -> devices map
+  // Devices are HOST-scoped, so key them by hostId. Keyed by hostName, the 60
+  // sites of one console all mapped to a single bucket.
   const hostDevices = new Map<string, DeviceEntry[]>();
   for (const d of devicesData) {
-    hostDevices.set(d.hostName, d.devices);
+    hostDevices.set(d.hostId, d.devices);
   }
 
   const siteEntries: SiteOverviewEntry[] = [];
 
   for (const site of sites.data) {
-    const hostName = hostIdToName.get(site.hostId) ?? "unknown";
-    const devices = hostDevices.get(hostName) ?? [];
+    // Reuse the index's label rule rather than re-deriving it here: falling
+    // back to meta.name yields the SLUG ("default"), not a name anyone knows.
+    const hostName = labels.get(site.siteId) ?? "unknown";
+    const devices = hostDevices.get(site.hostId) ?? [];
     const stats = site.statistics;
 
     const issues: Issue[] = [];
@@ -227,22 +227,27 @@ export async function listSitesOverview() {
 // --- Tool: analyze-site-health ---
 
 export const analyzeSiteHealthSchema = z.object({
-  name: z.string().describe("Site host name (e.g., 'USM', 'USV', 'USA', 'USS', 'USC')"),
+  name: z.string().describe(SITE_NAME_DESCRIPTION),
   extractFields: ef,
 });
 
 export async function analyzeSiteHealth(params: z.infer<typeof analyzeSiteHealthSchema>) {
-  const hostEntry = await resolveDevicesByHostName(params.name);
-  if (!hostEntry) {
+  // Was resolveDevicesByHostName -- an exact match on console hostname, which no
+  // customer on a shared console can satisfy, so this returned "not found" for
+  // every site on the UOS console before any analysis could run.
+  let resolved;
+  try {
+    resolved = await resolveDeviceHostEntry(params.name);
+  } catch (err) {
     return {
       site: params.name,
       status: "unknown" as Severity,
-      summary: `Site '${params.name}' not found`,
+      summary: err instanceof SiteResolutionError ? err.message : String(err),
       issues: [],
     };
   }
 
-  const devices = hostEntry.devices;
+  const devices = resolved.devices?.devices ?? [];
   const issues: Issue[] = [];
 
   for (const device of devices) {
@@ -258,10 +263,16 @@ export async function analyzeSiteHealth(params: z.infer<typeof analyzeSiteHealth
   let wanInfo: Record<string, string> = {};
   try {
     const sitesResp = await unifiClient.get<{ data: Array<{
+      siteId: string;
       hostId: string;
       statistics: SiteStatistics;
     }> }>("/sites");
-    const siteMatch = sitesResp.data.find((s) => s.hostId === hostEntry.hostId);
+    // By site id. `find(hostId)` returns the console's FIRST site, which on a
+    // 60-site console is the empty Default one -- so WAN stats were read from
+    // the wrong site for every customer sharing that console.
+    const siteMatch = sitesResp.data.find(
+      (s) => s.siteId === resolved.entry.cloudSiteId,
+    );
     if (siteMatch?.statistics.wans) {
       issues.push(...evaluateWanIssues(siteMatch.statistics.wans, params.name));
       for (const [name, wan] of Object.entries(siteMatch.statistics.wans)) {
@@ -314,7 +325,7 @@ interface RebootEntry {
 }
 
 export const detectRecentRebootsSchema = z.object({
-  name: z.string().optional().describe("Site host name to check (omit for all sites)"),
+  name: z.string().optional().describe(`${SITE_NAME_DESCRIPTION} Omit to check every site.`),
   hours: z.coerce.number().optional().default(24).describe("Look back period in hours (default: 24)"),
   extractFields: ef,
 });
@@ -322,9 +333,16 @@ export const detectRecentRebootsSchema = z.object({
 export async function detectRecentReboots(params: z.infer<typeof detectRecentRebootsSchema>) {
   const allDevices = await resolveAllDevices();
 
-  const entries = params.name
-    ? allDevices.filter((h) => h.hostName.toUpperCase() === params.name!.toUpperCase())
-    : allDevices;
+  // Resolve through the index rather than filtering on console hostname: on a
+  // shared console no customer name equals a hostname, so this filtered to
+  // nothing for every site the fork exists to reach.
+  let entries = allDevices;
+  if (params.name) {
+    const { entry } = await resolveDeviceHostEntry(params.name).catch(() => ({
+      entry: null,
+    }));
+    entries = entry ? allDevices.filter((h) => h.hostId === entry.hostId) : [];
+  }
 
   if (entries.length === 0 && params.name) {
     return {

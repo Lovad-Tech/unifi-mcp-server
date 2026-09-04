@@ -20,7 +20,7 @@ if (process.argv.includes("--doctor")) {
 
 // Raw API tools
 import { listHostsSchema, listHosts, getHostSchema, getHost } from "./tools/hosts.js";
-import { listSitesSchema, listSites } from "./tools/sites.js";
+import { listSitesSchema, listSites, listSiteIndexSchema, listSiteIndex } from "./tools/sites.js";
 import { listDevicesSchema, listDevices } from "./tools/devices.js";
 import { getIspMetricsSchema, getIspMetrics, queryIspMetricsSchema, queryIspMetrics } from "./tools/isp-metrics.js";
 import {
@@ -122,6 +122,13 @@ tool("get-host",
 tool("list-sites",
   "List all sites with statistics (device counts, WAN status, ISP info)",
   listSitesSchema.shape, wrapToolHandler(listSites));
+
+tool("find-site",
+  "Find sites by CUSTOMER name, console name, or slug. Use this first when a request "
+  + "names a customer rather than a console: on a UniFi OS Server every customer is a "
+  + "site on one shared console, so the customer name is not a host name. Returns every "
+  + "match so an ambiguous name can be narrowed.",
+  listSiteIndexSchema.shape, wrapToolHandler(listSiteIndex));
 
 tool("list-devices",
   "List all devices across hosts (switches, APs, gateways, cameras)",
