@@ -61,7 +61,9 @@ class LocalControllerClient {
       if (!tokenCookie) {
         throw new LocalControllerError("login response missing TOKEN cookie", res.status, null);
       }
-      this.cookie = tokenCookie.split(";", 1)[0];
+      // `split` always yields at least one element, but the compiler cannot
+      // know that; the fallback keeps the whole cookie rather than `undefined`.
+      this.cookie = tokenCookie.split(";", 1)[0] ?? tokenCookie;
       this.csrf =
         res.headers.get("x-updated-csrf-token") ??
         res.headers.get("x-csrf-token") ??

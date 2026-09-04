@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { unifiClient } from "./client.js";
 import { resolveDeviceHostEntry, resolveAllDevices } from "./helpers/resolver.js";
+import { soleSite } from "./helpers/select-site.js";
 
 const UI_DIR = join(dirname(fileURLToPath(import.meta.url)), "ui");
 const SUMMARIZE_SITE_HTML = readFileSync(join(UI_DIR, "summarize-site.html"), "utf-8");
@@ -48,8 +49,11 @@ export function registerResources(server: McpServer): void {
     async (uri, vars) => {
       const name = decodeURIComponent(String(vars.name));
       try {
-        const { entry, devices } = await resolveDeviceHostEntry(name);
-        return asJson(uri.toString(), { site: entry.displayName, ...(devices ?? {}) });
+        const { host, devices } = await resolveDeviceHostEntry(name);
+        // Name it as what it is: one site when the query picked one out, the
+        // console when it named the console.
+        const label = soleSite(host)?.displayName ?? host.hostName;
+        return asJson(uri.toString(), { site: label, ...(devices ?? {}) });
       } catch (err) {
         return asJson(uri.toString(), {
           error: err instanceof Error ? err.message : String(err),

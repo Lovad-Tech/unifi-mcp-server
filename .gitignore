@@ -6,3 +6,12 @@ dist/
 *.tsbuildinfo
 .DS_Store
 *.log
+
+# Internal working notes. This repo is PUBLIC: anything describing the real
+# fleet -- customer names, site counts, console hostnames, device counts --
+# stays local. Public rationale for the fork lives in README.md, without
+# numbers or names. See tests/no-customer-data.test.ts, which enforces the
+# same rule for anything that IS tracked.
+FORK.md
+notes/
+*.local.md

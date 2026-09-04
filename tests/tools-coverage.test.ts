@@ -14,6 +14,9 @@ vi.mock("../src/client.js", () => ({
   UniFiError: class extends Error {},
 }));
 
+const { clearSiteIndexCache } = await import(
+  "../src/helpers/site-index.js"
+);
 const sites = await import("../src/tools/sites.js");
 const hosts = await import("../src/tools/hosts.js");
 const devices = await import("../src/tools/devices.js");
@@ -21,6 +24,10 @@ const sdwan = await import("../src/tools/sdwan.js");
 const ispMetrics = await import("../src/tools/isp-metrics.js");
 
 beforeEach(() => {
+  // listSites now shares the process-wide /sites cache, so without this a
+  // second test in this file would assert against a request that never went
+  // out. Order-dependence, not a passing test.
+  clearSiteIndexCache();
   mockGet.mockReset();
   mockPost.mockReset();
 });

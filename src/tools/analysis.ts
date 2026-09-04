@@ -1,13 +1,12 @@
 import { z } from "zod/v4";
 import { SITE_NAME_DESCRIPTION } from "./site-param.js";
-import { unifiClient } from "../client.js";
 import {
-  resolveAllSites,
   resolveDeviceHostEntry,
   resolveAllDevices,
   type DeviceEntry,
 } from "../helpers/resolver.js";
-import { SiteResolutionError, siteLabelsBySiteId } from "../helpers/site-index.js";
+import { fetchSitesCached, SiteResolutionError, siteLabelsBySiteId } from "../helpers/site-index.js";
+import { siteScopeCaveat, soleSite } from "../helpers/select-site.js";
 import { extractFieldsDescription } from "./extract-fields.js";
 
 const ef = z.string().optional().describe(extractFieldsDescription);
@@ -42,7 +41,7 @@ function hoursAgo(isoTime: string | null): number | null {
   return diff / (1000 * 60 * 60);
 }
 
-function evaluateDeviceIssues(device: DeviceEntry, siteName: string): Issue[] {
+function evaluateDeviceIssues(device: DeviceEntry): Issue[] {
   const issues: Issue[] = [];
   const label = `${device.name} (${device.model})`;
 
@@ -89,17 +88,9 @@ function evaluateDeviceIssues(device: DeviceEntry, siteName: string): Issue[] {
   return issues;
 }
 
-interface SiteStatistics {
-  counts?: {
-    totalDevice?: number;
-    offlineDevice?: number;
-  };
-  gateway?: { shortname?: string };
-  percentages?: { wanUptime?: number };
-  wans?: Record<string, { wanUptime?: number; externalIp?: string }>;
-}
-
-function evaluateWanIssues(wans: Record<string, { wanUptime?: number; externalIp?: string }>, siteName: string): Issue[] {
+function evaluateWanIssues(
+  wans: Record<string, { wanUptime?: number; externalIp?: string }>,
+): Issue[] {
   const issues: Issue[] = [];
   for (const [name, wan] of Object.entries(wans)) {
     const uptime = wan.wanUptime;
@@ -153,16 +144,12 @@ export const listSitesOverviewSchema = z.object({
 });
 
 export async function listSitesOverview() {
-  const [sites, devicesData, labels] = await Promise.all([
-    unifiClient.get<{ data: Array<{
-      siteId: string;
-      hostId: string;
-      meta: { desc: string; name: string };
-      statistics: SiteStatistics;
-    }> }>("/sites"),
+  const [sites, devicesData, labelsResult] = await Promise.all([
+    fetchSitesCached(),
     resolveAllDevices(),
     siteLabelsBySiteId(),
   ]);
+  const { labels, degraded } = labelsResult;
 
   // Devices are HOST-scoped, so key them by hostId. Keyed by hostName, the 60
   // sites of one console all mapped to a single bucket.
@@ -173,23 +160,25 @@ export async function listSitesOverview() {
 
   const siteEntries: SiteOverviewEntry[] = [];
 
-  for (const site of sites.data) {
+  for (const site of sites) {
     // Reuse the index's label rule rather than re-deriving it here: falling
     // back to meta.name yields the SLUG ("default"), not a name anyone knows.
     const hostName = labels.get(site.siteId) ?? "unknown";
     const devices = hostDevices.get(site.hostId) ?? [];
-    const stats = site.statistics;
+    // `/sites` may omit statistics entirely; the three inline copies of this
+    // type all declared it required, which hid that.
+    const stats = site.statistics ?? {};
 
     const issues: Issue[] = [];
 
     // Evaluate each device
     for (const device of devices) {
-      issues.push(...evaluateDeviceIssues(device, hostName));
+      issues.push(...evaluateDeviceIssues(device));
     }
 
     // Evaluate WAN
     if (stats.wans) {
-      issues.push(...evaluateWanIssues(stats.wans, hostName));
+      issues.push(...evaluateWanIssues(stats.wans));
     }
 
     const online = devices.filter((d) => d.status === "online").length;
@@ -217,6 +206,9 @@ export async function listSitesOverview() {
 
   return {
     checkedAt: new Date().toISOString(),
+    // A fleet listing built from a partial index labels whole consoles
+    // "unknown". Saying why beats leaving the reader to guess.
+    ...(degraded.length ? { degraded } : {}),
     totalSites: siteEntries.length,
     status: worstSeverity(allIssues),
     summary: summarizeIssues(allIssues),
@@ -247,11 +239,15 @@ export async function analyzeSiteHealth(params: z.infer<typeof analyzeSiteHealth
     };
   }
 
+  // Reasons a section is missing, kept apart from `issues` -- which describes
+  // the NETWORK's health, not the lookup's. Folding the two together reports a
+  // gap in our own visibility as a fault at the customer site.
+  const caveats: string[] = [];
   const devices = resolved.devices?.devices ?? [];
   const issues: Issue[] = [];
 
   for (const device of devices) {
-    issues.push(...evaluateDeviceIssues(device, params.name));
+    issues.push(...evaluateDeviceIssues(device));
   }
 
   // Find gateway
@@ -262,20 +258,24 @@ export async function analyzeSiteHealth(params: z.infer<typeof analyzeSiteHealth
   // Get WAN info from sites API
   let wanInfo: Record<string, string> = {};
   try {
-    const sitesResp = await unifiClient.get<{ data: Array<{
-      siteId: string;
-      hostId: string;
-      statistics: SiteStatistics;
-    }> }>("/sites");
+    const siteRows = await fetchSitesCached();
     // By site id. `find(hostId)` returns the console's FIRST site, which on a
-    // 60-site console is the empty Default one -- so WAN stats were read from
-    // the wrong site for every customer sharing that console.
-    const siteMatch = sitesResp.data.find(
-      (s) => s.siteId === resolved.entry.cloudSiteId,
-    );
-    if (siteMatch?.statistics.wans) {
-      issues.push(...evaluateWanIssues(siteMatch.statistics.wans, params.name));
-      for (const [name, wan] of Object.entries(siteMatch.statistics.wans)) {
+    // large shared console is the empty Default one -- so WAN stats were read
+    // from the wrong site for every customer sharing that console.
+    //
+    // `soleSite` is null when the name picked out a CONSOLE rather than one
+    // site. There is no such thing as "the console's WAN uptime" on a shared
+    // box, so the section is omitted with a caveat rather than filled from an
+    // arbitrary tenant's statistics.
+    const site = soleSite(resolved.host);
+    const siteMatch = site
+      ? siteRows.find((s) => s.siteId === site.cloudSiteId)
+      : undefined;
+    const scopeCaveat = siteScopeCaveat(resolved.host, params.name);
+    if (scopeCaveat) caveats.push(scopeCaveat);
+    if (siteMatch?.statistics?.wans) {
+      issues.push(...evaluateWanIssues(siteMatch.statistics?.wans ?? {}));
+      for (const [name, wan] of Object.entries(siteMatch.statistics?.wans ?? {})) {
         wanInfo[name] = `${wan.wanUptime ?? "?"}% (${wan.externalIp ?? "no IP"})`;
       }
     }
@@ -309,6 +309,7 @@ export async function analyzeSiteHealth(params: z.infer<typeof analyzeSiteHealth
     },
     wan: wanInfo,
     issues,
+    ...(caveats.length ? { caveats } : {}),
     checkedAt: new Date().toISOString(),
   };
 }
@@ -338,10 +339,25 @@ export async function detectRecentReboots(params: z.infer<typeof detectRecentReb
   // nothing for every site the fork exists to reach.
   let entries = allDevices;
   if (params.name) {
-    const { entry } = await resolveDeviceHostEntry(params.name).catch(() => ({
-      entry: null,
-    }));
-    entries = entry ? allDevices.filter((h) => h.hostId === entry.hostId) : [];
+    // A bare catch reported an ambiguous name, a /sites outage and a real typo
+    // identically as "not found" -- discarding the whole point of the status
+    // taxonomy at the last step.
+    let resolveError: string | null = null;
+    const { host } = await resolveDeviceHostEntry(params.name).catch(
+      (err: unknown) => {
+        resolveError = err instanceof Error ? err.message : String(err);
+        return { host: null };
+      },
+    );
+    if (resolveError !== null) {
+      return {
+        checkedAt: new Date().toISOString(),
+        threshold: `${params.hours}h`,
+        sites: [],
+        caveats: [resolveError as string],
+      };
+    }
+    entries = host ? allDevices.filter((h) => h.hostId === host.hostId) : [];
   }
 
   if (entries.length === 0 && params.name) {
