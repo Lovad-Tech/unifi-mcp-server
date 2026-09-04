@@ -55,20 +55,70 @@ Also: `list-sites` is now trimmed by default (it returned ~150 KB untrimmed, whi
 the adjacent `list-hosts` already trimmed); new `find-site` tool for searching the
 fleet by customer name.
 
+## Also fixed, because the first pass missed them
+
+Four review passes (reuse / simplification / efficiency / altitude) found the fix
+was applied unevenly. Recorded because each is a place the same bug could return:
+
+- **Six call sites still matched console hostnames exactly** — including
+  `siteHealthTimeline`, where the old call had been replaced with a *verbatim
+  inline copy* of the same exact-hostname match while its parameter advertised
+  customer names. `tests/no-exact-host-match.test.ts` now fails on the pattern
+  anywhere in `src/`.
+- **Four fleet listings were keyed on hostId**, so all 60 sites of the shared
+  console carried one label and `listSitesOverview` bucketed them into one row.
+  They join on `siteId` now, via `siteLabelsBySiteId()`.
+- **`SiteResolutionError` is a `wrapToolHandler` extractor**, not a per-tool
+  catch. The fallback branch keeps only `message`, so any tool that forgot to
+  catch silently lost the status this fork exists to preserve.
+- **The drift guard had two holes** — it scanned only `src/tools/`, missing
+  `prompts.ts` (7 params, plus body text telling the model to "call `list-hosts`
+  to enumerate consoles"), and its regex anchored on a prefix so
+  `"Specific site host names to compare"` passed vacuously.
+
+## Operational notes
+
+- 30 s **negative cache** on connector failures: a dead console costs 1 call, not
+  60, against a 100 req/min per-console limit.
+- A shared **in-flight promise** for the index, so N concurrent tools cause one
+  fetch pair rather than N.
+- `/hosts` is **optional** — `/sites` alone carries every customer name, so
+  losing `/hosts` degrades the fallback label, not reach. `/sites` failing is
+  fatal by design: an empty index would report every real site as "not found".
+
 ## Verified
 
 Against the live fleet, with the built `dist/`:
 
 ```
-index entries: 86
-sites on the UOS console: 60
-distinct localSiteIds resolved for 60 UOS sites: 60 (failures: 0)
+index entries: 86  (84 sites + 2 consoles with no Network sites)
+59 UOS customer sites -> 59 distinct localSiteIds, 0 failures
+listings: 82 distinct labels across 84 rows, no "default"/"unknown"
+"Advanced Tire"              -> asks, naming all 5 branches
+"Advanced Tire - Ocala East" -> resolves directly, 8 devices
 ```
 
+Over real MCP, through supergateway, from a container on `mcp-net`: 55 tools,
+`find-site` registered, ambiguous queries return `isError` with the candidate
+list, exact names resolve.
+
+71 unit tests. Nine guards mutation-checked (deleted, confirmed red, restored).
 Unit tests use synthetic fixtures only (`tests/fixtures/fleet.ts`) — this fork is
 public, so no customer names are committed. The fixtures copy the API *shapes*
-verbatim, including the `meta.name`/`internalReference` flip that the join
-depends on.
+verbatim, including the `meta.name`/`internalReference` flip the join depends on.
+
+## Known gaps
+
+- `analytics.ts` / `analysis.ts` refetch `/sites` that `buildSiteIndex` just
+  fetched, and `/devices` is uncached with three new callers. Flagged by the
+  efficiency review; not addressed.
+- `firmwareInventory` still labels by console: `/devices` is host-scoped, so on a
+  shared console there is genuinely no per-site attribution to be had.
+- **Fabrics are not readable by anyone.** All three official OpenAPI specs
+  (Network v10.4.57, Site Manager v1.0.0, Carrier Fabric v1.0.0) contain zero
+  `fabric` endpoints; "Carrier Fabric" is ISP subscriber billing, unrelated. A
+  site that is Fabric-managed may therefore be invisible to `/v1/sites` entirely
+  — unconfirmed, and not something this fork can work around.
 
 ## Upstream
 
