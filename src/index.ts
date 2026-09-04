@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { startMcpServer } from "@us-all/mcp-toolkit/runtime";
 import { inferToolAnnotations } from "@us-all/mcp-toolkit";
 import { validateConfig, isConnectorAvailable, isLocalAvailable } from "./config.js";
+import { clearSiteIndexCache } from "./helpers/site-index.js";
 import { wrapToolHandler } from "./tools/utils.js";
 import { runDoctor } from "./doctor.js";
 
@@ -354,7 +355,11 @@ async function summarizeSiteWithCard(args: Parameters<typeof wrappedSummarizeSit
   const result = await wrappedSummarizeSite(args);
   if (result.isError) return result;
   try {
-    const structured = JSON.parse(result.content[0].text);
+    // `content[0]` is not guaranteed by the type. An empty content array would
+    // have thrown a TypeError here rather than returning the tool's own error.
+    const first = result.content[0];
+    if (!first) return result;
+    const structured = JSON.parse(first.text);
     return {
       ...result,
       structuredContent: structured,
@@ -386,6 +391,20 @@ registerResources(server);
 
 // === MCP Prompts (workflow templates) ===
 registerPrompts(server);
+
+/**
+ * The operator's only way to drop a stale fleet index without a restart.
+ *
+ * `clearSiteIndexCache` was reachable from tests and nowhere else, so an
+ * operator who knew the index was wrong -- a site renamed in the UniFi portal,
+ * say -- had no remedy short of restarting the container and dropping every
+ * other cache with it. SIGHUP is the conventional "reload" signal and costs
+ * two cloud calls to recover from.
+ */
+process.on("SIGHUP", () => {
+  clearSiteIndexCache();
+  console.error("[UniFi] SIGHUP: site index cache cleared");
+});
 
 const baseCount = isConnectorAvailable() ? 54 : 19;
 const toolCount = baseCount + (isLocalAvailable() ? 2 : 0);

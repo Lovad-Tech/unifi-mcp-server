@@ -7,28 +7,13 @@ import {
   resolveLocalSiteId,
   SiteResolutionError,
 } from "./site-index.js";
-import { selectSite } from "./select-site.js";
-
-interface HostInfo {
-  id: string;
-  hostName: string;
-  siteId: string;
-}
+import type { HostGroup } from "./select-site.js";
+import { selectHost, selectSite } from "./select-site.js";
 
 interface SiteInfo {
   siteId: string;
   hostId: string;
   hostName: string;
-}
-
-interface HostResponse {
-  id: string;
-  reportedState?: { hostname?: string };
-}
-
-interface SiteResponse {
-  siteId: string;
-  hostId: string;
 }
 
 interface DeviceHostEntry {
@@ -53,24 +38,34 @@ export interface DeviceEntry {
   startupTime: string | null;
 }
 
+/**
+ * Every site with its console name. Served from the shared index, which already
+ * holds exactly this join -- it used to issue its own `/hosts` + `/sites` pair
+ * alongside the index's, so any tool calling both paid for four requests.
+ *
+ * Host-only rows (a console carrying no Network site) are dropped: this returns
+ * SITES, and adding a row with an empty `siteId` would silently widen it.
+ */
 export async function resolveAllSites(): Promise<SiteInfo[]> {
-  const [hosts, sitesResp] = await Promise.all([
-    unifiClient.get<{ data: HostResponse[] }>("/hosts"),
-    unifiClient.get<{ data: SiteResponse[] }>("/sites"),
-  ]);
-
-  const hostMap = new Map<string, string>();
-  for (const h of hosts.data) {
-    hostMap.set(h.id, h.reportedState?.hostname ?? "unknown");
-  }
-
-  return sitesResp.data.map((s) => ({
-    siteId: s.siteId,
-    hostId: s.hostId,
-    hostName: hostMap.get(s.hostId) ?? "unknown",
-  }));
+  const { entries } = await buildSiteIndex();
+  return entries
+    .filter((e) => e.cloudSiteId)
+    .map((e) => ({
+      siteId: e.cloudSiteId,
+      hostId: e.hostId,
+      hostName: e.hostName,
+    }));
 }
 
+/**
+ * Fleet device inventory.
+ *
+ * Deliberately NOT cached, unlike the site index. The field that matters here is
+ * `status` -- a tech asking "is it online?" during triage is asking about right
+ * now, and a cached "online" for a box that dropped a minute ago is worse than
+ * the round trip it saves. The index caches identity, which does not change; this
+ * carries state, which does.
+ */
 export async function resolveAllDevices(): Promise<DeviceHostEntry[]> {
   const response = await unifiClient.get<{ data: DeviceHostEntry[] }>(
     "/devices",
@@ -89,21 +84,65 @@ export interface ConnectorContext {
 }
 
 /**
- * Resolve a free-text name to exactly one site, or refuse with a typed reason.
+ * Append why the index is incomplete, when it is.
  *
- * The single entry point for "which site did they mean?". Everything that needs
- * a site goes through here, so the ambiguity policy cannot be bypassed.
+ * A "no site matches" built from a partial feed is a different claim from one
+ * built from a whole feed, and the caller cannot tell them apart otherwise --
+ * which is how a `/hosts` outage came to look exactly like a typo.
+ */
+function withIndexHealth(message: string, degraded: readonly string[]): string {
+  return degraded.length ? `${message} NOTE: ${degraded.join(" ")}` : message;
+}
+
+/**
+ * Resolve a free-text name to exactly one SITE, or refuse with a typed reason.
+ *
+ * The single entry point for "which site did they mean?". Everything needing a
+ * site id goes through here, so the ambiguity policy cannot be bypassed.
  */
 export async function resolveSiteEntry(name: string): Promise<SiteEntry> {
   const index = await buildSiteIndex();
-  const selection = selectSite(matchSites(index, name), name);
+  const selection = selectSite(matchSites(index.entries, name), name);
 
   if (!selection.chosen) {
     // 300 when the caller must narrow down, 404 when nothing matched at all.
     const status =
-      selection.candidates.length > 1 ? RESOLUTION.AMBIGUOUS : RESOLUTION.NOT_FOUND;
+      selection.candidates.length > 1
+        ? RESOLUTION.AMBIGUOUS
+        : RESOLUTION.NOT_FOUND;
     throw new SiteResolutionError(
-      selection.reason ?? `'${name}' did not match any site or console.`,
+      withIndexHealth(
+        selection.reason ?? `'${name}' did not match any site or console.`,
+        index.degraded,
+      ),
+      status,
+    );
+  }
+
+  return selection.chosen;
+}
+
+/**
+ * Resolve a free-text name to exactly one CONSOLE.
+ *
+ * For host-scoped endpoints only. Every site on a console returns the same
+ * host-scoped answer, so a name matching many sites of ONE console is not
+ * ambiguous here -- routing these callers through `resolveSiteEntry` made a
+ * console with many sites permanently unreachable by its own name, while the
+ * parameter description told the model that name was valid input.
+ */
+export async function resolveHostEntry(name: string): Promise<HostGroup> {
+  const index = await buildSiteIndex();
+  const selection = selectHost(matchSites(index.entries, name), name);
+
+  if (!selection.chosen) {
+    const status =
+      selection.groups.length > 1 ? RESOLUTION.AMBIGUOUS : RESOLUTION.NOT_FOUND;
+    throw new SiteResolutionError(
+      withIndexHealth(
+        selection.reason ?? `'${name}' did not match any site or console.`,
+        index.degraded,
+      ),
       status,
     );
   }
@@ -118,13 +157,24 @@ export async function resolveSiteEntry(name: string): Promise<SiteEntry> {
  * inventory -- that is the API's shape, not a bug here. What was a bug is
  * reaching it by exact hostname match, which no customer on a shared console
  * could ever satisfy.
+ *
+ * `host.sites` carries every site the name matched. A caller wanting a
+ * SITE-scoped figure alongside the inventory must use `soleSite`, which returns
+ * null when the name picked out a console rather than one site -- reporting one
+ * arbitrary site's statistics under a console's name is the original bug.
  */
 export async function resolveDeviceHostEntry(
   name: string,
-): Promise<{ entry: SiteEntry; devices: DeviceHostEntry | null }> {
-  const entry = await resolveSiteEntry(name);
-  const all = await resolveAllDevices();
-  return { entry, devices: all.find((h) => h.hostId === entry.hostId) ?? null };
+): Promise<{ host: HostGroup; devices: DeviceHostEntry | null }> {
+  // Independent: `resolveAllDevices` takes no argument. Serialised, a cold
+  // cache paid /hosts+/sites THEN /devices on the hot path of nearly every
+  // semantic tool. Promise.all attaches a handler to both, so a rejection from
+  // either surfaces normally rather than becoming an unhandled rejection.
+  const [host, all] = await Promise.all([
+    resolveHostEntry(name),
+    resolveAllDevices(),
+  ]);
+  return { host, devices: all.find((h) => h.hostId === host.hostId) ?? null };
 }
 
 /**
@@ -135,6 +185,8 @@ export async function resolveDeviceHostEntry(
  * empty "Default" site. Now goes through the fleet-wide index, which searches
  * customer names as well as console names and joins to the correct local site id
  * on `internalReference`.
+ *
+ * SITE-scoped, so it keeps the strict policy: a connector call acts on one site.
  *
  * Throws `SiteResolutionError` rather than returning null, so "no such site"
  * (404), "console unreachable" (502) and "ambiguous" (300) stay distinguishable.
@@ -152,3 +204,4 @@ export async function resolveConnectorContext(
     displayName: entry.displayName,
   };
 }
+

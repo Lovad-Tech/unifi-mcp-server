@@ -1,11 +1,9 @@
 import { z } from "zod/v4";
 import { SITE_NAME_DESCRIPTION } from "./site-param.js";
-import { buildSiteIndex, matchSites, siteLabelsBySiteId } from "../helpers/site-index.js";
-import { unifiClient } from "../client.js";
+import { fetchSitesCached, buildSiteIndex, matchSites, siteLabelsBySiteId } from "../helpers/site-index.js";
 import { connectorClient } from "../connector-client.js";
 import {
   resolveAllDevices,
-  resolveAllSites,
   resolveConnectorContext,
 } from "../helpers/resolver.js";
 import { isConnectorAvailable } from "../config.js";
@@ -19,13 +17,6 @@ const ef = z.string().optional().describe(extractFieldsDescription);
  * fleet-wide patterns that single-site tools cannot.
  */
 
-interface SiteStatistics {
-  counts?: { totalDevice?: number; offlineDevice?: number };
-  gateway?: { shortname?: string };
-  percentages?: { wanUptime?: number };
-  wans?: Record<string, { wanUptime?: number; externalIp?: string }>;
-}
-
 // --- Tool: compare-sites -------------------------------------------------
 
 export const compareSitesSchema = z.object({
@@ -34,12 +25,16 @@ export const compareSitesSchema = z.object({
 });
 
 export async function compareSites(params: z.infer<typeof compareSitesSchema>) {
-  const [sitesResp, devicesData, labels] = await Promise.all([
-    unifiClient.get<{ data: Array<{ siteId: string; hostId: string; statistics: SiteStatistics }> }>("/sites"),
+  const [siteRows, devicesData, index] = await Promise.all([
+    fetchSitesCached(),
     resolveAllDevices(),
-    siteLabelsBySiteId(),
+    buildSiteIndex(),
   ]);
-  const index = await buildSiteIndex();
+  // Labels come off the index we already hold; asking for them separately made
+  // this issue a second identical /sites request.
+  const labels = new Map(
+    index.entries.filter((e) => e.cloudSiteId).map((e) => [e.cloudSiteId, e.displayName]),
+  );
 
   // Label and filter on the SITE, not the console. Keyed on hostName, all 60
   // sites of a shared console carried one label and a customer-name filter
@@ -47,12 +42,12 @@ export async function compareSites(params: z.infer<typeof compareSitesSchema>) {
   const filterSet = params.names
     ? new Set(
         params.names.flatMap((n) =>
-          matchSites(index, n).map((e) => e.cloudSiteId),
+          matchSites(index.entries, n).map((e) => e.cloudSiteId),
         ),
       )
     : null;
 
-  const rows = sitesResp.data
+  const rows = siteRows
     .map((site) => {
       const hostName = labels.get(site.siteId) ?? "unknown";
       if (filterSet && !filterSet.has(site.siteId)) return null;
@@ -62,13 +57,13 @@ export async function compareSites(params: z.infer<typeof compareSitesSchema>) {
       const offline = devices.length - online;
       const onlinePct = devices.length === 0 ? 0 : Math.round((online / devices.length) * 1000) / 10;
 
-      const wanUptimes = Object.values(site.statistics.wans ?? {}).map((w) => w.wanUptime ?? 0);
+      const wanUptimes = Object.values(site.statistics?.wans ?? {}).map((w) => w.wanUptime ?? 0);
       const minWan = wanUptimes.length === 0 ? null : Math.min(...wanUptimes);
       const avgWan = wanUptimes.length === 0 ? null : Math.round(wanUptimes.reduce((a, b) => a + b, 0) / wanUptimes.length * 10) / 10;
 
       return {
         site: hostName,
-        gateway: site.statistics.gateway?.shortname ?? "unknown",
+        gateway: site.statistics?.gateway?.shortname ?? "unknown",
         devices: { total: devices.length, online, offline, onlinePct },
         wan: { min: minWan, avg: avgWan, count: wanUptimes.length },
       };
@@ -149,11 +144,9 @@ export const wanUptimeTrendSchema = z.object({
 });
 
 export async function wanUptimeTrend(params: z.infer<typeof wanUptimeTrendSchema>) {
-  const [labels, sitesResp] = await Promise.all([
+  const [{ labels, degraded }, siteRows] = await Promise.all([
     siteLabelsBySiteId(),
-    unifiClient.get<{
-      data: Array<{ siteId: string; hostId: string; statistics: SiteStatistics }>;
-    }>("/sites"),
+    fetchSitesCached(),
   ]);
 
   const rows: Array<{
@@ -164,9 +157,9 @@ export async function wanUptimeTrend(params: z.infer<typeof wanUptimeTrendSchema
     severity: "healthy" | "warning" | "critical";
   }> = [];
 
-  for (const s of sitesResp.data) {
+  for (const s of siteRows) {
     const hostName = labels.get(s.siteId) ?? "unknown";
-    const wans = s.statistics.wans ?? {};
+    const wans = s.statistics?.wans ?? {};
     for (const [wanName, wan] of Object.entries(wans)) {
       const uptime = wan.wanUptime ?? 0;
       let severity: "healthy" | "warning" | "critical" = "healthy";
@@ -193,6 +186,9 @@ export async function wanUptimeTrend(params: z.infer<typeof wanUptimeTrendSchema
 
   return {
     checkedAt: new Date().toISOString(),
+    // A fleet listing built from a partial index labels whole consoles
+    // "unknown". Saying why beats leaving the reader to guess.
+    ...(degraded.length ? { degraded } : {}),
     threshold: params.threshold,
     totalWans: rows.length,
     avgUptime,

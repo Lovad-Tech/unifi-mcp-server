@@ -147,3 +147,22 @@ export const NORTHWIND_LOCAL_SITES_RESPONSE = {
   offset: 0,
   limit: 200,
 };
+
+/**
+ * A one-site payload used to prove that a build already in flight when the
+ * cache is cleared cannot write its result afterwards.
+ *
+ * Wingtip Toys is another of Microsoft's standard fictional companies, added
+ * here rather than invented inline because `tests/no-customer-data.test.ts`
+ * requires every example name to come from this file --- which is the whole
+ * point: inventing a name is the moment to notice it might be a real one.
+ */
+export const STALE_SITES_RESPONSE = {
+  data: [
+    {
+      siteId: "stale-site",
+      hostId: UOS_HOST_ID,
+      meta: { name: "stale", desc: "Wingtip Toys" },
+    },
+  ],
+};

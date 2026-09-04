@@ -1,8 +1,7 @@
 import { z } from "zod/v4";
 import { applyExtractFields } from "@us-all/mcp-toolkit";
-import { unifiClient } from "../client.js";
 import { extractFieldsDescription } from "./extract-fields.js";
-import { buildSiteIndex, matchSites } from "../helpers/site-index.js";
+import { fetchSitesCached, buildSiteIndex, matchSites } from "../helpers/site-index.js";
 
 const ef = z.string().optional().describe(extractFieldsDescription);
 
@@ -19,12 +18,14 @@ export const listSitesSchema = z.object({
  * `extractFields` for a different projection.
  */
 export async function listSites(params: z.infer<typeof listSitesSchema> = {}) {
-  const response = await unifiClient.get<{ data: unknown[] }>("/sites");
+  // Same cached payload the index and the analytics tools read: one /sites
+  // request serves the whole process for a TTL, not one per tool.
+  const rows = await fetchSitesCached();
   // Applied, not ignored. `listHosts` upstream returns the RAW payload when a
   // projection is passed, which makes the parameter mean its own opposite.
-  if (params.extractFields) return applyExtractFields(response.data, params.extractFields);
+  if (params.extractFields) return applyExtractFields(rows, params.extractFields);
   return applyExtractFields(
-    response.data,
+    rows,
     "*.siteId,*.hostId,*.meta.name,*.meta.desc,*.meta.timezone,*.statistics.counts.totalDevice,*.statistics.counts.offlineDevice",
   );
 }
@@ -61,12 +62,17 @@ export async function listSiteIndex(
 ) {
   const index = await buildSiteIndex();
   const limit = params.limit ?? SITE_INDEX_DEFAULT_LIMIT;
-  const rows = params.query ? matchSites(index, params.query) : index;
+  const rows = params.query
+    ? matchSites(index.entries, params.query)
+    : index.entries;
 
   // Report the true total, so a truncated answer never reads as the whole fleet.
+  // `degraded` rides along for the same reason: an empty result from a partial
+  // index means "we cannot see it", not "it does not exist".
   return {
     total: rows.length,
     returned: Math.min(rows.length, limit),
+    ...(index.degraded.length ? { degraded: index.degraded } : {}),
     sites: rows.slice(0, limit),
   };
 }

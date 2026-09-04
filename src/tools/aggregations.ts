@@ -1,10 +1,10 @@
 import { z } from "zod/v4";
 import { SITE_NAME_DESCRIPTION } from "./site-param.js";
 import { aggregate } from "@us-all/mcp-toolkit";
-import { unifiClient } from "../client.js";
 import { connectorClient } from "../connector-client.js";
 import { resolveConnectorContext, resolveDeviceHostEntry } from "../helpers/resolver.js";
-import { SiteResolutionError } from "../helpers/site-index.js";
+import { fetchSitesCached, SiteResolutionError } from "../helpers/site-index.js";
+import { siteScopeCaveat, soleSite } from "../helpers/select-site.js";
 import { isConnectorAvailable } from "../config.js";
 import { extractFieldsDescription } from "./extract-fields.js";
 
@@ -47,13 +47,6 @@ export const summarizeSiteSchema = z.object({
   extractFields: ef,
 });
 
-interface SiteWanInfo { wanUptime?: number; externalIp?: string }
-interface SiteStats {
-  counts?: { totalDevice?: number; offlineDevice?: number };
-  gateway?: { shortname?: string };
-  wans?: Record<string, SiteWanInfo>;
-}
-
 export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>) {
   const name = params.name;
 
@@ -61,10 +54,10 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
   // resolveDevicesByHostName, an exact match on console hostname, and bail
   // before any of the site resolution below could run -- so every customer on a
   // multi-site console got "site not found" from right here.
-  let entry;
+  let host;
   let hostEntry;
   try {
-    ({ entry, devices: hostEntry } = await resolveDeviceHostEntry(name));
+    ({ host, devices: hostEntry } = await resolveDeviceHostEntry(name));
   } catch (err) {
     return {
       site: name,
@@ -73,12 +66,22 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
     };
   }
 
-  const sitesResp = await unifiClient.get<{ data: Array<{ siteId: string; hostId: string; statistics: SiteStats }> }>("/sites").catch(() => ({ data: [] }));
-  // By site id, not by host id: a console carrying many sites returns many rows here
-  // and `find(hostId)` takes whichever is first -- the empty Default site.
-  const siteData = sitesResp.data.find((s) => s.siteId === entry.cloudSiteId);
+  const siteRows = await fetchSitesCached().catch(() => []);
 
   const caveats: string[] = [];
+
+  // By site id, not by host id: a console carrying many sites returns many rows
+  // here and `find(hostId)` takes whichever is first -- the empty Default site.
+  //
+  // `soleSite` is null when the name picked out the CONSOLE. A console has no
+  // single WAN, so the statistics are omitted rather than borrowed from an
+  // arbitrary tenant on the same box.
+  const site = soleSite(host);
+  const siteData = site
+    ? siteRows.find((s) => s.siteId === site.cloudSiteId)
+    : undefined;
+  const scopeCaveat = siteScopeCaveat(host, name);
+  if (scopeCaveat) caveats.push(scopeCaveat);
 
   let connectorCtx = null;
   if (isConnectorAvailable() && (params.includeClients || params.includeNetworks || params.includeWifi)) {
@@ -111,7 +114,7 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
   // Callers needing full device payload should use list-devices directly.
   // A console can be absent from /devices (it reports only hosts the key owns
   // devices for). That is an empty device list, not a failed lookup.
-  if (!hostEntry) caveats.push(`no device inventory returned for console ${entry.hostName}`);
+  if (!hostEntry) caveats.push(`no device inventory returned for console ${host.hostName}`);
   const devices = (hostEntry?.devices ?? []).map((d) => ({
     id: d.id,
     mac: d.mac,
@@ -127,7 +130,7 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
     startupTime: d.startupTime,
   }));
   const onlineDevices = devices.filter((d) => d.status === "online").length;
-  const wans = siteData?.statistics.wans ?? {};
+  const wans = siteData?.statistics?.wans ?? {};
   const minWanUptime = Object.values(wans).reduce<number | null>((acc, w) => {
     const u = w.wanUptime ?? null;
     if (u === null) return acc;
@@ -136,14 +139,14 @@ export async function summarizeSite(params: z.infer<typeof summarizeSiteSchema>)
 
   return {
     site: name,
-    hostId: entry.hostId,
+    hostId: host.hostId,
     devices: { total: devices.length, online: onlineDevices, offline: devices.length - onlineDevices, list: devices },
     wan: wans,
     clients,
     networks,
     wifiBroadcasts: wifi,
     summary: {
-      gateway: siteData?.statistics.gateway?.shortname ?? "unknown",
+      gateway: siteData?.statistics?.gateway?.shortname ?? "unknown",
       deviceOnlinePct: devices.length === 0 ? 0 : Math.round((onlineDevices / devices.length) * 1000) / 10,
       minWanUptime,
       // connectorAvailable reflects the owner-key capability, independent of
@@ -245,7 +248,7 @@ export async function siteHealthTimeline(params: z.infer<typeof siteHealthTimeli
   const { sites, connectorContext } = await aggregate(
     {
       sites: () =>
-        unifiClient.get<{ data: Array<{ hostId: string; statistics: { wans?: Record<string, { wanUptime?: number; externalIp?: string }> } }> }>("/sites"),
+        fetchSitesCached(),
       connectorContext: connectorAvailable ? () => resolveConnectorContext(params.hostName) : () => Promise.resolve(null),
     },
     caveats,
@@ -254,9 +257,16 @@ export async function siteHealthTimeline(params: z.infer<typeof siteHealthTimeli
   // --- WAN aggregation (current / lifetime state from /sites) ---
   let wanUptimePct: number | null = null;
   let wanSamples = 0;
-  if (sites) {
-    const siteData = sites.data.find((s) => s.hostId === hostEntry.hostId);
-    const wans = siteData?.statistics.wans ?? {};
+  // The SAME positional bug the fork exists to remove, third instance:
+  // `find(hostId)` returns the console's FIRST /sites row, which on a shared
+  // console is the empty Default site. WAN uptime is per SITE, so when the name
+  // resolved to a console rather than one site there is no figure to report.
+  const timelineSite = soleSite(timelineEntry.host);
+  const timelineCaveat = siteScopeCaveat(timelineEntry.host, params.hostName);
+  if (timelineCaveat) caveats.push(timelineCaveat);
+  if (sites && timelineSite) {
+    const siteData = sites.find((s) => s.siteId === timelineSite.cloudSiteId);
+    const wans = siteData?.statistics?.wans ?? {};
     const uptimes = Object.values(wans)
       .map((w) => w.wanUptime)
       .filter((u): u is number => typeof u === "number");

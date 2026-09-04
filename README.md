@@ -10,6 +10,34 @@
 [![@us-all standard](https://img.shields.io/badge/built%20to-%40us--all%20MCP%20standard-blue)](https://github.com/us-all/mcp-toolkit/blob/main/STANDARD.md)
 [![Glama MCP server](https://glama.ai/mcp/servers/us-all/unifi-mcp-server/badges/score.svg)](https://glama.ai/mcp/servers/us-all/unifi-mcp-server)
 
+## About this fork
+
+This is a fork of [`us-all/unifi-mcp-server`](https://github.com/us-all/unifi-mcp-server). It changes one thing: **how a name is resolved to a site.**
+
+Upstream matches a console's hostname exactly, then takes the first site on that
+console. That works on a fleet of single-site consoles. It does not work on a
+UniFi OS Server, where every customer is a separate *site* on one *shared*
+console: no customer name can equal the console's hostname, and every lookup
+that does resolve returns the console's first site --- usually the empty
+`Default` placeholder. The failure is silent; you get another site's data, not
+an error.
+
+The fork builds a fleet-wide index instead, joining Site Manager's `meta.name`
+to the local Network API's `internalReference`, and searches customer names as
+well as console names. Two consequences worth knowing about:
+
+- **Ambiguity is refused, not guessed.** A name matching several sites returns
+  the candidate list. Similar names usually mean one customer with several
+  locations, which is the worst moment to guess --- and this resolver will front
+  the write path when Ubiquiti ships write scopes.
+- **Site questions and console questions are answered differently.** Device
+  inventory is per *console*, so many sites on one console is not ambiguity
+  there. Statistics are per *site*, and are omitted rather than borrowed from a
+  neighbouring tenant when a name picks out the console.
+
+Upstream's tools, prompts and transports are otherwise unchanged. Fixtures in
+`tests/` are synthetic by policy and enforced by `tests/no-customer-data.test.ts`.
+
 ## Pre-flight diagnostic
 
 ```bash
